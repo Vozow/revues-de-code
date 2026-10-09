@@ -14,24 +14,20 @@
 
 ## 1. Identification de l'équipe
 
-- **Préfixe :** `<année>-<etablissement>-<groupe>` — ex. `2026-IUT-BUT3-DUPONT`
-  - `année` = année universitaire (ex. `2026`)
-  - `etablissement` = établissement et promotion (ex. `IUT-BUT3`)
-  - `groupe` = nom de famille du porteur, **sans accent, en majuscules**
-    (ex. `DUPONT`, `LEFEVRE`, `MARTIN-GARCIA`)
-- **Porteur de l'équipe :** (nom + pseudo GitHub)
+- **Préfixe :** 2026-IUT-BUT3-TURMINE
+- **Porteur de l'équipe :** Ilyas Turmine / Vozow
 
 ## 2. Étudiants de l'équipe
 
 | Nom (état civil) | Pseudo GitHub | Rôle |
 |------------------|---------------|------|
-|                  |               | porteur |
-|                  |               | membre |
-|                  |               | membre |
+|Turmine Ilyas                  |Vozow               | porteur |
+|Toussaint--Verdier Bastian                  |bastian-tv               | membre |
+|Devaux Erwan                  |erwan-dvx               | membre |
 
 ## 3. Rendu
 
-- **TD :** (ex. `TD1`)
+- **TD :** TD0
 - **Lien de la PR :** (à coller une fois la PR ouverte)
 
 ## 4. Note — réservée à l'enseignant
