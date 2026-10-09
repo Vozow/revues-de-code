@@ -26,7 +26,7 @@ vi.mock("@prisma/client", () => ({
   Prisma: {},
 }));
 
-import { Product, Price, Supplier, Warehouse, InvalidPriceError } from "./Product";
+import { Product, Price, Supplier, Warehouse, InvalidPriceError, InvalidImageError, InvalidDiscountError } from "./Product";
 
 function hasProp(obj: unknown, propName: string): boolean {
   return typeof obj === "object" && obj !== null && propName in (obj as object);
@@ -478,5 +478,45 @@ describe("Price validation", () => {
     const price = new Price(100, "EUR");
     expect(() => { price.margin = -1; }).toThrow(InvalidPriceError);
     expect(price.margin).toBe(15);
+  });
+});
+
+describe("catalog validation and consistency", () => {
+  it("does not replace an image when overwrite is false", async () => {
+    const product = makeTypedProduct();
+    await product.addImage("hero", "https://example.com/old.png");
+    await expect(product.addImage("hero", "https://example.com/new.png", false))
+      .rejects.toThrow(InvalidImageError);
+    expect(product.images.hero).toBe("https://example.com/old.png");
+  });
+  it("accepts an uppercase HTTP scheme", async () => {
+    const product = makeTypedProduct();
+    await product.addImage("hero", "HTTP://example.com/image.png");
+    expect(product.images.hero).toBe("HTTP://example.com/image.png");
+  });
+  it("rejects an empty URL with an honest message", async () => {
+    await expect(makeTypedProduct().addImage("hero", ""))
+      .rejects.toThrow("image URL is required");
+  });
+  it("selects the same supplier regardless of insertion order", async () => {
+    for (const reverse of [false, true]) {
+      const product = makeTypedProduct();
+      const suppliers = [new Supplier("s1", "Alpha", "a@example.com", "EU"),
+        new Supplier("s2", "Beta", "b@example.com", "US")];
+      if (reverse) suppliers.reverse();
+      for (const supplier of suppliers) product.suppliersRegions.set(supplier.region, supplier);
+      await product.addImage("hero", "https://example.com/old.png");
+      await product.addImage("hero", "https://example.com/new.png");
+      expect(product.images["hero-Alpha"]).toBe("https://example.com/new.png");
+      expect(product.images["hero-Beta"]).toBeUndefined();
+    }
+  });
+  it("rejects an invalid date and duplicate discount", async () => {
+    const product = makeTypedProduct();
+    await expect(product.addDiscount("SUMMER20", new Date(NaN)))
+      .rejects.toThrow(InvalidDiscountError);
+    await expect(product.addDiscount("WELCOME10", new Date(Date.now() + 86400000)))
+      .rejects.toThrow(InvalidDiscountError);
+    expect(product.discounts).toEqual(["WELCOME10"]);
   });
 });

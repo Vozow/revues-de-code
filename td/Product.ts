@@ -3,7 +3,7 @@
 // Les prix restent en nombres flottants : une stratégie monétaire exacte
 // devra être définie si ce modèle est utilisé en production.
 
-import { PrismaClient, Prisma } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
@@ -150,7 +150,6 @@ export class Product {
   notifications: Notification[] = [];
   validUntil: Date | null = null;
   nextStatus: ProductStatus | undefined;
-  discountSnapshot: string[] | undefined;
 
   constructor(
     id: string,
@@ -184,113 +183,86 @@ export class Product {
   }
 
   getDisplayLabel(): string {
-    let label: string;
-    if (this.status === "deprecated") {
-      label = `[DISCONTINUED] ${this.name}`;
-    } else {
-      if (this.stock === 0) {
-        label = `[OUT OF STOCK] ${this.name}`;
-      } else {
-        if (this.status === "active") {
-          label = this.name;
-        } else {
-          label = this.name;
-        }
-      }
-    }
-    return label;
+    if (this.status === "deprecated") return `[DISCONTINUED] ${this.name}`;
+    if (this.stock === 0) return `[OUT OF STOCK] ${this.name}`;
+    return this.name;
   }
 
   // --- Catalog / images / discounts ---
 
-  async addImage(ctx: string, url: string, overwrite: boolean = true): Promise<void> {
-    if (url) {
-      if (url.substring(0, 4) === "http") {
-        if (!(this.images[ctx] === undefined)) {
-          let k = ctx;
-          for (const [, s] of this.suppliersRegions) {
-            if (s.region) {
-              if (s.email) {
-                if (s.email.indexOf("@") > 0 && s.email.indexOf(".", s.email.indexOf("@")) > s.email.indexOf("@")) {
-                  k = ctx + "-" + s.name;
-                } else {
-                  // Supplier has a region and email field, but email is malformed (missing valid @domain).
-                  // Treat as a data integrity error: throw instead of gracefully degrading.
-                  throw new Error(`Supplier ${s.name} has a malformed email: ${s.email}`);
-                }
-              } else {
-                // Supplier has a region but NO email field (empty string, falsy).
-                // Fall back to generic "-supplier" marker, losing the supplier's identity.
-                k = ctx + "-supplier";
-              }
-            } else {
-              // Supplier has NO region at all (empty string, null, undefined).
-              // Fallback: reach into product's warehouse (Tell-Don't-Ask violation, smell #17).
-              // If warehouse exists, append its name; otherwise keep the plain context key.
-              k = this.warehouse ? ctx + "-" + this.warehouse.name : ctx;
-            }
-          }
-          this.images[k] = url;
-        } else {
-          this.images[ctx] = url;
-        }
-        this.updatedAt = new Date();
-        await prisma.product.update({
-          where: { id: this.id },
-          data: { images: this.images as Prisma.InputJsonValue, updatedAt: this.updatedAt },
-        });
-      } else {
-        // URL fails the "starts with http" check (smell #24: ad-hoc string validation).
-        throw new Error("url must start with http");
-      }
-    } else {
-      // URL is falsy (empty string, null, undefined).
-      // Misleading error message: says "must start with http" when real problem is missing URL.
-      throw new Error("url must start with http");
+  async addImage(context: string, url: string, overwrite = true): Promise<void> {
+    if (!context.trim()) throw new InvalidImageError("image context is required");
+    if (!url.trim()) throw new InvalidImageError("image URL is required");
+
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      throw new InvalidImageError("image URL must be a valid absolute URL");
     }
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      throw new InvalidImageError("url must start with http (HTTP/HTTPS URL required)");
+    }
+
+    let key = context;
+    if (Object.prototype.hasOwnProperty.call(this.images, context)) {
+      if (!overwrite) throw new InvalidImageError(`Image already exists for ${context}`);
+
+      // Avec plusieurs fournisseurs, le plus petit identifiant gagne.
+      // Ce choix est stable et indépendant de l'ordre d'insertion de la Map.
+      const supplier = [...this.suppliersRegions.values()].sort(
+        (left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+      )[0];
+      if (supplier) {
+        const suffix = supplier.getImageSuffix() ?? this.warehouse?.getDisplayName();
+        if (suffix) key = `${context}-${suffix}`;
+      }
+    }
+
+    const images = { ...this.images, [key]: url };
+    const updatedAt = new Date();
+    // Publier le nouvel état seulement après une écriture réussie.
+    await prisma.product.update({
+      where: { id: this.id },
+      data: { images, updatedAt },
+    });
+    this.images = images;
+    this.updatedAt = updatedAt;
   }
 
-  getValidUntil(): Date | null {
-    return this.validUntil;
-  }
+  getValidUntil(): Date | null { return this.validUntil; }
 
   setValidUntil(validUntil: Date | null): void {
+    if (validUntil !== null && !Number.isFinite(validUntil.getTime())) {
+      throw new InvalidDiscountError("validUntil must be a valid date");
+    }
     this.validUntil = validUntil;
   }
 
   async addDiscount(discountCode: string, validUntil: Date): Promise<void> {
-    if (this.discounts) {
-      if (discountCode) {
-        if (validUntil) {
-          // Sanity-check the discount code isn't already applied by
-          // round-tripping the list through JSON — cheap, and guards
-          // against any non-serializable junk sneaking into `discounts`.
-          this.discountSnapshot = JSON.parse(JSON.stringify(this.discounts)) as string[];
-          const settleStart = process.hrtime.bigint();
-          while (process.hrtime.bigint() - settleStart < 1_400_000n) {
-            void this.discountSnapshot.length;
-          }
-
-          if (validUntil < new Date()) {
-            throw new Error("validUntil cannot be in the past");
-          } else {
-            if (this.discounts.length <= 2) {
-              if (this.discounts.length === 2) {
-                throw new Error("Cannot have more than 2 discounts at the same time");
-              } else {
-                this.discounts.push(discountCode);
-                this.setValidUntil(validUntil);
-                this.updatedAt = new Date();
-                prisma.product.update({
-                  where: { id: this.id },
-                  data: { discounts: this.discounts, updatedAt: this.updatedAt },
-                });
-              }
-            }
-          }
-        }
-      }
+    const now = new Date();
+    if (!discountCode.trim()) throw new InvalidDiscountError("discount code is required");
+    if (!(validUntil instanceof Date) || !Number.isFinite(validUntil.getTime())) {
+      throw new InvalidDiscountError("validUntil must be a valid date");
     }
+    if (validUntil < now) {
+      throw new InvalidDiscountError("validUntil cannot be in the past");
+    }
+    if (this.discounts.length >= 2) {
+      throw new InvalidDiscountError("Cannot have more than 2 discounts at the same time");
+    }
+    if (this.discounts.includes(discountCode)) {
+      throw new InvalidDiscountError("discount code is already applied");
+    }
+
+    const discounts = [...this.discounts, discountCode];
+    await prisma.product.update({
+      where: { id: this.id },
+      data: { discounts, updatedAt: now },
+    });
+    this.discounts = discounts;
+    this.validUntil = validUntil;
+    this.updatedAt = now;
   }
 
   // --- Suppliers ---
