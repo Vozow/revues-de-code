@@ -1,11 +1,12 @@
-// Modèle de produit : état en mémoire et persistance Prisma séparés.
-// Les mutateurs doivent garantir la cohérence en cas d'échec de l'écriture.
+// Modèle métier sans dépendance Prisma : le repository injecté gère la base.
+// Sans repository, l'objet fonctionne exclusivement en mémoire (tests inclus).
+// Le service de notifications gère les messages et leur cycle de vie.
+// Les appels de mutation d'un même objet doivent être exécutés séquentiellement.
 // Les prix restent en nombres flottants : une stratégie monétaire exacte
 // devra être définie si ce modèle est utilisé en production.
 
-import { PrismaClient } from "@prisma/client";
-
-const prisma = new PrismaClient();
+import type { ProductRepository } from "./ProductRepository";
+import { NotificationService } from "./NotificationService";
 
 export type Channel = "email" | "sms" | "push";
 export type ProductStatus = "active" | "out_of_stock" | "deprecated";
@@ -147,9 +148,11 @@ export class Product {
   status: ProductStatus;
   createdAt: Date;
   updatedAt: Date;
-  notifications: Notification[] = [];
+  // Lecture d'une copie : seul le service modifie sa file d'attente.
+  get notifications(): readonly Notification[] {
+    return this.notificationService.pending;
+  }
   validUntil: Date | null = null;
-  nextStatus: ProductStatus | undefined;
 
   constructor(
     id: string,
@@ -164,6 +167,8 @@ export class Product {
     quantity: number,
     stock: number,
     warehouse: Warehouse | null,
+    private readonly repository?: ProductRepository,
+    private readonly notificationService = new NotificationService(),
   ) {
     this.id = id;
     this.name = name;
@@ -222,10 +227,7 @@ export class Product {
     const images = { ...this.images, [key]: url };
     const updatedAt = new Date();
     // Publier le nouvel état seulement après une écriture réussie.
-    await prisma.product.update({
-      where: { id: this.id },
-      data: { images, updatedAt },
-    });
+    await this.repository?.update(this.id, { images, updatedAt });
     this.images = images;
     this.updatedAt = updatedAt;
   }
@@ -256,10 +258,7 @@ export class Product {
     }
 
     const discounts = [...this.discounts, discountCode];
-    await prisma.product.update({
-      where: { id: this.id },
-      data: { discounts, updatedAt: now },
-    });
+    await this.repository?.update(this.id, { discounts, updatedAt: now });
     this.discounts = discounts;
     this.validUntil = validUntil;
     this.updatedAt = now;
@@ -267,103 +266,101 @@ export class Product {
 
   // --- Suppliers ---
 
-  async addSupplierToRegion(region: string, splrs: Supplier[]): Promise<void> {
-    const s = splrs.find((x) => x.region === region);
-    if (!s) throw new Error(`No supplier found for region ${region}`);
-
-    this.suppliersRegions.set(region, s);
-    this.updatedAt = new Date();
-
-    await prisma.productSupplier.upsert({
-      where: { productId_region: { productId: this.id, region: region } },
-      create: { productId: this.id, region: region, supplierId: s.id },
-      update: { supplierId: s.id },
-    });
+  async addSupplierToRegion(region: string, suppliers: Supplier[]): Promise<void> {
+    const supplier = suppliers.find(candidate => candidate.servesRegion(region));
+    if (!supplier) throw new SupplierNotFoundError(`No supplier found for region ${region}`);
+    const updatedAt = new Date();
+    await this.repository?.assignSupplier(this.id, region, supplier.id);
+    this.suppliersRegions.set(region, supplier);
+    this.updatedAt = updatedAt;
   }
 
   // --- Pricing ---
 
   getResellerPrice(): number {
-    const mgnAmt = (this.price.amount * this.price.margin) / 100;
-    const vatAmt = (mgnAmt * this.price.vat) / 100;
-    return this.price.amount + mgnAmt + vatAmt;
+    return this.price.getResellerPrice();
   }
 
   async setMargin(marginPercentage: number): Promise<void> {
-    this.price.margin = marginPercentage;
-    this.updatedAt = new Date();
-    await prisma.product.update({
-      where: { id: this.id },
-      data: { priceMargin: marginPercentage, updatedAt: this.updatedAt },
-    });
+    // Valider une copie : le prix actuel reste intact si l'écriture échoue.
+    const candidate = new Price(this.price.amount, this.price.currency);
+    candidate.margin = marginPercentage;
+    const updatedAt = new Date();
+    await this.repository?.update(this.id, { priceMargin: candidate.margin, updatedAt });
+    this.price.margin = candidate.margin;
+    this.updatedAt = updatedAt;
   }
 
-  // --- Stock ---
+  // --- Stock / lifecycle ---
+
+  private requirePositiveQuantity(quantity: number): void {
+    if (!Number.isSafeInteger(quantity) || quantity <= 0) {
+      throw new InvalidQuantityError("quantity must be a positive safe integer");
+    }
+  }
+
+  private nextStatusFor(action: "receive" | "sell" | "deprecate", stock: number): ProductStatus {
+    if (this.status === "deprecated" && action !== "deprecate") {
+      throw new InvalidStatusError("Cannot change stock of a deprecated product");
+    }
+    if (action === "deprecate") return "deprecated";
+    return stock === 0 ? "out_of_stock" : "active";
+  }
 
   async receiveStock(quantity: number): Promise<void> {
-    this.stock += quantity;
-    this.quantity += quantity;
-    this.updatedAt = new Date();
-    console.log(`Restocking ${this.name} at ${this.warehouse!.name}`);
-    await prisma.product.update({
-      where: { id: this.id },
-      data: { stock: this.stock, quantity: this.quantity, updatedAt: this.updatedAt },
-    });
+    this.requirePositiveQuantity(quantity);
+    const stock = this.stock + quantity;
+    const totalQuantity = this.quantity + quantity;
+    if (!Number.isSafeInteger(stock) || !Number.isSafeInteger(totalQuantity)) {
+      throw new InvalidQuantityError("resulting stock and quantity must be safe integers");
+    }
+    const status = this.nextStatusFor("receive", stock);
+    const updatedAt = new Date();
+    // Aucun affichage ici : recevoir du stock ne nécessite pas d'entrepôt.
+    await this.repository?.update(this.id, { stock, quantity: totalQuantity, status, updatedAt });
+    this.stock = stock;
+    this.quantity = totalQuantity;
+    this.status = status;
+    this.updatedAt = updatedAt;
   }
 
   async sell(quantity: number): Promise<void> {
-    if (this.stock < quantity) throw new Error("Not enough stock");
-
-    this.stock -= quantity;
-    this.updatedAt = new Date();
-
-    if (this.stock === 0) {
-      this.nextStatus = "out_of_stock";
-      this.status = this.nextStatus as ProductStatus;
-    }
-
-    await prisma.product.update({
-      where: { id: this.id },
-      data: { stock: this.stock, status: this.status, updatedAt: this.updatedAt },
-    });
-
-    // Notify all regional suppliers
-    for (const [region, s] of this.suppliersRegions) {
-      this.notifications.push(this.createNotification(s.email, `Product sold: ${this.name}`, `${quantity} unit(s) of ${this.name} were sold. Remaining stock: ${this.stock}.`));
-    }
+    this.requirePositiveQuantity(quantity);
+    const stock = this.stock - quantity;
+    const status = this.nextStatusFor("sell", stock);
+    if (stock < 0) throw new InsufficientStockError("Not enough stock");
+    // Préparer aussi les notifications avant l'écriture, sans modifier l'objet.
+    const notifications = this.notificationService.prepareSale(
+      { id: this.id, name: this.name, quantity, remainingStock: stock },
+      this.getSupplierRecipients(),
+    );
+    const updatedAt = new Date();
+    await this.repository?.update(this.id, { stock, status, updatedAt });
+    this.stock = stock;
+    this.status = status;
+    this.updatedAt = updatedAt;
+    this.notificationService.enqueue(notifications);
   }
-
-  // --- Lifecycle ---
 
   async deprecate(): Promise<void> {
-    this.status = "deprecated";
+    if (this.status === "deprecated") return;
+    const status = this.nextStatusFor("deprecate", 0);
+    const notifications = this.notificationService.prepareDeprecation(
+      { id: this.id, name: this.name }, this.getSupplierRecipients(),
+    );
+    const updatedAt = new Date();
+    await this.repository?.update(this.id, { status, stock: 0, updatedAt });
+    this.status = status;
     this.stock = 0;
-    this.updatedAt = new Date();
-
-    await prisma.product.update({
-      where: { id: this.id },
-      data: { status: this.status, stock: this.stock, updatedAt: this.updatedAt },
-    });
-
-    // Notify all regional suppliers
-    for (const [, s] of this.suppliersRegions) {
-      this.notifications.push(this.createNotification(s.email, `Product deprecated: ${this.name}`, `The product ${this.name} has been deprecated and removed from the catalog.`));
-    }
-
-    // Notify customers
-    this.notifications.push(this.createNotification("customers@omniproduct.com", `Product no longer available: ${this.name}`, `${this.name} is no longer available.`));
+    this.updatedAt = updatedAt;
+    this.notificationService.enqueue(notifications);
   }
 
-  // small helper to cut down repetition in notif building
-  private createNotification(recipient: string, subject: string, body: string): Notification {
-    return {
-      id: crypto.randomUUID(),
-      recipient: recipient,
-      subject: subject,
-      body: body,
-      channel: "email",
-      sentAt: new Date(),
-      productId: this.id,
-    };
+  private getSupplierRecipients(): string[] {
+    return [...this.suppliersRegions.values()].map(supplier => supplier.getNotificationRecipient());
+  }
+
+  async flushNotifications(send: (notification: Notification) => Promise<void>): Promise<void> {
+    await this.notificationService.flush(send);
   }
 }

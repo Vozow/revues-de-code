@@ -13,20 +13,13 @@
 
 import { describe, it, expect, vi } from "vitest";
 
-// Product.ts instantiates a real PrismaClient at module load and calls
-// prisma.product.update()/upsert() from inside its own mutators (this is
-// itself one of the documented smells — the entity is its own repository).
-// These tests care about naming, not persistence, so Prisma is stubbed out
-// entirely rather than requiring a live database.
-vi.mock("@prisma/client", () => ({
-  PrismaClient: vi.fn().mockImplementation(function (this: any) {
-    this.product = { update: vi.fn().mockResolvedValue(undefined) };
-    this.productSupplier = { upsert: vi.fn().mockResolvedValue(undefined) };
-  }),
-  Prisma: {},
-}));
+// Le modèle n'importe plus Prisma : tests métier sans mock de base.
+import type { ProductRepository } from "./ProductRepository";
+import { NotificationService } from "./NotificationService";
+import { PrismaProductRepository } from "./ProductRepository";
+import type { PrismaClient } from "@prisma/client";
 
-import { Product, Price, Supplier, Warehouse, InvalidPriceError, InvalidImageError, InvalidDiscountError } from "./Product";
+import { Product, Price, Supplier, Warehouse, InvalidPriceError, InvalidImageError, InvalidDiscountError, InvalidQuantityError, InvalidStatusError } from "./Product";
 
 function hasProp(obj: unknown, propName: string): boolean {
   return typeof obj === "object" && obj !== null && propName in (obj as object);
@@ -174,7 +167,7 @@ describe("Product", () => {
 // do what they claim, using today's real (abbreviated) typed API rather
 // than `as any` casts.
 
-function makeTypedProduct() {
+function makeTypedProduct(repository?: ProductRepository) {
   const price = new Price(50, "EUR");
   return new Product(
     "p1",
@@ -189,6 +182,7 @@ function makeTypedProduct() {
     100,
     100,
     null,
+    repository,
   );
 }
 
@@ -518,5 +512,146 @@ describe("catalog validation and consistency", () => {
     await expect(product.addDiscount("WELCOME10", new Date(Date.now() + 86400000)))
       .rejects.toThrow(InvalidDiscountError);
     expect(product.discounts).toEqual(["WELCOME10"]);
+  });
+});
+
+describe("stock validation and transitions", () => {
+  it("receives stock without a warehouse and reactivates an empty product", async () => {
+    const product = makeTypedProduct();
+    await product.sell(100);
+    await product.receiveStock(5);
+    expect(product.stock).toBe(5);
+    expect(product.status).toBe("active");
+  });
+  it.each([0, -1, 0.5, NaN, Infinity])("rejects invalid quantity %s", async (quantity) => {
+    const product = makeTypedProduct();
+    await expect(product.sell(quantity)).rejects.toThrow(InvalidQuantityError);
+    await expect(product.receiveStock(quantity)).rejects.toThrow(InvalidQuantityError);
+    expect(product.stock).toBe(100);
+    expect(product.quantity).toBe(100);
+  });
+  it("forbids selling or restocking a deprecated product", async () => {
+    const product = makeTypedProduct();
+    await product.deprecate();
+    await expect(product.sell(1)).rejects.toThrow(InvalidStatusError);
+    await expect(product.receiveStock(1)).rejects.toThrow(InvalidStatusError);
+    expect(product.status).toBe("deprecated");
+    expect(product.stock).toBe(0);
+  });
+  it("does not send duplicate notifications when deprecating twice", async () => {
+    const product = makeTypedProduct();
+    await product.deprecate();
+    const count = product.notifications.length;
+    await product.deprecate();
+    expect(product.notifications).toHaveLength(count);
+  });
+});
+
+
+describe("failed persistence leaves the object unchanged", () => {
+  it("preserves the entire state when a mutation fails", async () => {
+    const repository: ProductRepository = {
+      update: vi.fn().mockResolvedValue(undefined),
+      assignSupplier: vi.fn().mockResolvedValue(undefined),
+    };
+    const client = { product: { update: vi.mocked(repository.update) },
+      productSupplier: { upsert: vi.mocked(repository.assignSupplier) } };
+    const product = makeTypedProduct(repository);
+    product.suppliersRegions.set("EU", new Supplier("s1", "Alpha", "a@example.com", "EU"));
+    const updatedAt = product.updatedAt;
+    const failure = new Error("database unavailable");
+    const operations = [
+      () => product.addImage("hero", "https://example.com/image.png"),
+      () => product.addDiscount("SUMMER20", new Date(Date.now() + 86400000)),
+      () => product.setMargin(30),
+      () => product.receiveStock(5),
+      () => product.sell(5),
+      () => product.deprecate(),
+      () => product.addSupplierToRegion("US", [new Supplier("s2", "Beta", "b@example.com", "US")]),
+    ];
+    for (const operation of operations) {
+      client.product.update.mockRejectedValueOnce(failure);
+      client.productSupplier.upsert.mockRejectedValueOnce(failure);
+      try {
+        await expect(operation()).rejects.toThrow("database unavailable");
+        expect(product.stock).toBe(100);
+        expect(product.quantity).toBe(100);
+        expect(product.status).toBe("active");
+        expect(product.price.margin).toBe(15);
+        expect(product.discounts).toEqual(["WELCOME10"]);
+        expect(product.images).toEqual({ thumbnail: "http://img/thumb.png" });
+        expect(product.getValidUntil()).toBeNull();
+        expect(product.updatedAt).toBe(updatedAt);
+        expect(product.notifications).toEqual([]);
+        expect(product.suppliersRegions.has("US")).toBe(false);
+      } finally {
+        client.product.update.mockReset().mockResolvedValue(undefined);
+        client.productSupplier.upsert.mockReset().mockResolvedValue(undefined);
+      }
+    }
+  });
+});
+
+describe("notification service lifecycle", () => {
+  it("builds and sends notifications without constructing Product", async () => {
+    const service = new NotificationService("clients@example.com");
+    const notifications = service.prepareSale({ id: "p1", name: "Mouse", quantity: 2, remainingStock: 8 },
+      ["a@example.com", "b@example.com"]);
+    service.enqueue(notifications);
+    const recipients: string[] = [];
+    await service.flush(async notification => { recipients.push(notification.recipient); });
+    expect(recipients).toEqual(["a@example.com", "b@example.com"]);
+    expect(service.pending).toHaveLength(0);
+  });
+  it("keeps failed and unsent messages for retry, without resending successes", async () => {
+    const service = new NotificationService();
+    service.enqueue(service.prepareSale({ id: "p1", name: "Mouse", quantity: 1, remainingStock: 9 },
+      ["a@example.com", "b@example.com", "c@example.com"]));
+    const sent: string[] = [];
+    await expect(service.flush(async notification => {
+      if (notification.recipient === "b@example.com") throw new Error("send failed");
+      sent.push(notification.recipient);
+    })).rejects.toThrow("send failed");
+    expect(service.pending.map(notification => notification.recipient)).toEqual(["b@example.com", "c@example.com"]);
+    await service.flush(async notification => { sent.push(notification.recipient); });
+    expect(sent).toEqual(["a@example.com", "b@example.com", "c@example.com"]);
+    expect(service.pending).toHaveLength(0);
+  });
+  it("shares an in-flight flush to avoid duplicate sends", async () => {
+    const service = new NotificationService();
+    service.enqueue(service.prepareSale({ id: "p1", name: "Mouse", quantity: 1, remainingStock: 9 }, ["a@example.com"]));
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const sent: string[] = [];
+    const send = async (notification: { recipient: string }) => {
+      await gate;
+      sent.push(notification.recipient);
+    };
+    const first = service.flush(send);
+    const second = service.flush(send);
+    release();
+    await Promise.all([first, second]);
+    expect(sent).toEqual(["a@example.com"]);
+    expect(service.pending).toHaveLength(0);
+  });
+});
+
+describe("repository hydration", () => {
+  it("loads regional suppliers and domain state from an in-memory record", async () => {
+    const date = new Date("2026-01-01T12:00:00Z");
+    const record = {
+      id: "p1", name: "Mouse", slug: "mouse", priceAmount: 50, priceCurrency: "EUR",
+      priceMargin: 15, priceVat: 20, discounts: [], images: { hero: "https://example.com/hero.png" },
+      weight: 0.2, dimensions: null, quantity: 10, stock: 0, status: "out_of_stock",
+      createdAt: date, updatedAt: date, warehouse: null,
+      suppliers: [{ region: "EU", supplier: { id: "s1", name: "Alpha", email: "a@example.com", region: "EU" } }],
+    };
+    const fakeClient = { product: { findUnique: async () => record } } as unknown as PrismaClient;
+    const product = await new PrismaProductRepository(fakeClient).load("p1");
+    expect(product.suppliersRegions.get("EU")?.name).toBe("Alpha");
+    expect(product.status).toBe("out_of_stock");
+    expect(product.price.getResellerPrice()).toBe(59);
+    expect(product.createdAt).toEqual(date);
+    expect(product.images.hero).toBe("https://example.com/hero.png");
   });
 });
