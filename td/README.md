@@ -18,11 +18,11 @@ Tout le rendu du groupe porte le préfixe
 **`<année>-<etablissement>-<groupe>`**, où `groupe` est le **nom de famille
 du porteur** (sans accent, en majuscules) :
 
-| Élément | Format | Exemple |
-|---------|--------|---------|
-| Préfixe | `2026-IUT-BUT3-DUPONT` | — |
-| Branche | `<préfixe>-td<N>` | `2026-IUT-BUT3-DUPONT-td1` |
-| Titre de PR | `<préfixe> — TD<N> — revue de <fichiers>` | `2026-IUT-BUT3-DUPONT — TD1 — revue de cart.ts` |
+| Élément | Format                                              | Exemple |
+|---------|-----------------------------------------------------|---------|
+| Préfixe | `2026-IUT-BUT3-TURMINE-`                            | — |
+| Branche | `2026-IUT-BUT3-TURMINE-td0`                         | `2026-IUT-BUT3-DUPONT-td1` |
+| Titre de PR | `2026-IUT-BUT3-TURMINE - TD0 - revue de product.ts` | `2026-IUT-BUT3-DUPONT — TD1 — revue de cart.ts` |
 
 Le préfixe permet à l'enseignant d'identifier immédiatement le groupe, la
 promotion et l'année dans la liste des PR.
